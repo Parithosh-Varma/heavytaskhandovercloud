@@ -86,7 +86,7 @@ hth run "echo hi" --dry-run
 | `hth kill <id>` | `tmux kill-session -t <id>`. Marks job `killed` locally, stops its keepalive. |
 | `hth clean [id] [-y]` | With id: `rm -rf ~/hth/jobs/<id>` + drop from local state. Without id: `rm -rf ~/hth/jobs && mkdir -p ~/hth/jobs` + clear state (asks unless `-y`). |
 
-Global flags: `--project P` (or `HTH_PROJECT` env) is passed as `--project=P` to every gcloud call. `--dry-run` works globally (`hth --dry-run run ...`) or per-command (`hth run ... --dry-run`).
+Global flags: `--project P` (or `HTH_PROJECT` env) is passed as `--project=P` to every gcloud call. `--dry-run` works globally (`hth --dry-run run ...`) or per-command (`hth run ... --dry-run`). Display: `--no-color` (or `NO_COLOR=1`) disables colors/spinners for pipes and CI; `--debug` shows raw tracebacks.
 
 Local state: `~/.hth/jobs.json` maps `id -> {id, command, start_time, last_known_status, exit_code?}`. Remote layout per job:
 
@@ -109,7 +109,7 @@ Local state: `~/.hth/jobs.json` maps `id -> {id, command, start_time, last_known
 
 ## Development
 
-Stdlib only, single file (`hth`). Test without Cloud Shell:
+Stdlib only: `hth` plus `lib/ui.py` (terminal styling, no dependencies). Test without Cloud Shell:
 
 ```bash
 ./hth init --dry-run

@@ -25,7 +25,19 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from pathlib import Path
+
+try:
+    _HERE = os.path.dirname(os.path.abspath(__file__))
+    if _HERE not in sys.path:
+        sys.path.insert(0, _HERE)
+    from lib import ui
+except Exception:
+    # Running without lib/ (e.g. copied binary): fall back to plain output.
+    # This path is never used in the repo checkout.
+    sys.stderr.write("error: lib/ui.py not found next to hth\n")
+    sys.exit(1)
 
 VERSION = "0.1.0"
 REMOTE_BASE = "~/hth/jobs"
@@ -34,22 +46,31 @@ LOCAL_JOBS_FILE = LOCAL_DIR / "jobs.json"
 KEEPALIVE_INTERVAL_SEC = 240
 
 
-# ---------- small output helpers ----------
+# ---------- output: everything routes through lib/ui.py ----------
 
 def eprint(*a, **k):
-    print(*a, file=sys.stderr, **k)
+    sep = k.get("sep", " ")
+    end = k.get("end", "\n")
+    ui.err(sep.join(str(x) for x in a) + ("" if end == "\n" else end))
 
 
 def ok(msg):
-    print(msg)
+    ui.info(msg)
 
 
 def warn(msg):
-    eprint("warning: " + msg)
+    ui.warn(msg)
 
 
-def fail(msg, code=1):
-    eprint("error: " + msg)
+def fail(title, why=None, fix=None, code=1):
+    # Backwards-compatible: fail("some text") still works; new call sites
+    # pass why/fix for the structured error format.
+    if why is None and fix is None and "\n" in str(title):
+        parts = str(title).splitlines()
+        title, rest = parts[0], "\n".join(parts[1:])
+        # Heuristic: lines starting with two spaces or containing a command are the fix.
+        why, fix = rest, None
+    ui.error(title, why=why, fix=fix)
     sys.exit(code)
 
 
@@ -64,6 +85,14 @@ def sh_join(cmd):
 
 def effective_dry_run(args):
     return bool(getattr(args, "global_dry_run", False) or getattr(args, "dry_run", False))
+
+
+def effective_no_color(args):
+    return bool(getattr(args, "global_no_color", False) or getattr(args, "no_color", False))
+
+
+def effective_debug(args):
+    return bool(getattr(args, "global_debug", False) or getattr(args, "debug", False))
 
 
 def effective_project(args):
@@ -105,29 +134,27 @@ def friendly_gcloud_error(stderr, cmd):
     s = (stderr or "").lower()
     if "quota" in s or "exhausted" in s or "resource_exhausted" in s or "429" in s:
         return (
-            "Cloud Shell quota looks exhausted or unavailable.\n"
-            "  Try again in a few minutes. If it persists, check\n"
-            "  https://cloud.google.com/shell/quotas and try a different account/project.\n"
-            "  Your local files and job ids are untouched."
+            ("Cloud Shell quota exhausted or unavailable.",
+             "Free Cloud Shell has weekly/CPU limits; the VM may also be starting.",
+             "Wait a few minutes and retry: hth init")
         )
     if "unauthenticated" in s or "reauth" in s or "not logged in" in s or "no active account" in s:
         return (
-            "gcloud is not logged in.\n"
-            "  Run: gcloud auth login\n"
-            "  Then: hth init"
+            ("gcloud is not logged in.",
+             "No active account found for gcloud.",
+             "gcloud auth login")
         )
     if "permission denied" in s or "permissiondenied" in s or "403" in s:
         return (
-            "Permission denied talking to Cloud Shell.\n"
-            "  Run: gcloud auth login\n"
-            "  Then: hth init\n"
-            "  If it persists, check your project/IAM permissions."
+            ("Permission denied talking to Cloud Shell.",
+             "The gcloud account lacks Cloud Shell access or the project forbids it.",
+             "gcloud auth login  # then: hth init")
         )
     if "authorize" in s and "session" in s:
         return (
-            "Cloud Shell session needs authorization.\n"
-            "  Run: hth init\n"
-            "  (this runs gcloud cloud-shell ssh --authorize-session)."
+            ("Cloud Shell session needs authorization.",
+             "The session token was rejected.",
+             "hth init")
         )
     return None
 
@@ -135,7 +162,7 @@ def friendly_gcloud_error(stderr, cmd):
 def run_gcloud(cmd, dry_run=False, capture=True, check_text="gcloud"):
     """Run a gcloud command. In dry-run, print and return a fake success."""
     if dry_run:
-        print("+ " + sh_join(cmd))
+        ui.dry_run_cmd(cmd)
         class Fake:
             returncode = 0
             stdout = ""
@@ -145,21 +172,30 @@ def run_gcloud(cmd, dry_run=False, capture=True, check_text="gcloud"):
         r = subprocess.run(cmd, capture_output=capture, text=True)
     except FileNotFoundError:
         fail(
-            "gcloud CLI not found.\n"
-            "  Install it: https://cloud.google.com/sdk/docs/install\n"
-            "  Then: gcloud auth login && hth init"
+            "gcloud CLI not found",
+            why="hth shells out to gcloud for every Cloud Shell operation.",
+            fix="Install it: https://cloud.google.com/sdk/docs/install  # then: gcloud auth login && hth init"
         )
     if r.returncode != 0:
-        msg = friendly_gcloud_error((r.stderr or "") + "\n" + (r.stdout or ""), cmd)
-        if msg:
-            eprint(msg)
-            eprint("--- gcloud output (trimmed) ---")
-            tail = (r.stderr or r.stdout or "")[-2000:]
-            eprint(tail.strip())
+        structured = friendly_gcloud_error((r.stderr or "") + "\n" + (r.stdout or ""), cmd)
+        if structured:
+            title, why, fix = structured
+            tail = (r.stderr or r.stdout or "")[-800:].strip()
+            if tail:
+                why = why + "\nDetails: " + " ".join(tail.split())[:300]
+            ui.error(title, why=why, fix=fix)
+            if ui.is_debug():
+                ui.err("--- raw gcloud output ---")
+                ui.err((r.stderr or r.stdout or "")[-3000:].strip())
+                traceback.print_exc()
             sys.exit(1)
-        eprint("gcloud failed (exit %d): %s" % (r.returncode, sh_join(cmd)))
-        if r.stderr:
-            eprint((r.stderr or "")[-3000:].strip())
+        ui.error(
+            "gcloud failed (exit %d)" % r.returncode,
+            why=" ".join((r.stderr or "")[-800:].split())[:400] or sh_join(cmd),
+            fix="hth init --dry-run  # inspect the exact gcloud invocation"
+        )
+        if ui.is_debug():
+            traceback.print_exc()
         sys.exit(1)
     return r
 
@@ -167,9 +203,9 @@ def run_gcloud(cmd, dry_run=False, capture=True, check_text="gcloud"):
 def check_gcloud_exists():
     if shutil.which("gcloud") is None:
         fail(
-            "gcloud CLI not found.\n"
-            "  Install it: https://cloud.google.com/sdk/docs/install\n"
-            "  Then: gcloud auth login && hth init"
+            "gcloud CLI not found",
+            why="hth shells out to gcloud for every Cloud Shell operation.",
+            fix="Install it: https://cloud.google.com/sdk/docs/install  # then: gcloud auth login && hth init"
         )
 
 
@@ -177,17 +213,21 @@ def check_gcloud_auth(dry_run=False, project=None):
     """Verify `gcloud auth list` has an active account. Returns account or ''."""
     cmd = ["gcloud", "auth", "list", "--filter=status:ACTIVE", "--format=value(account)"]
     if dry_run:
-        print("+ " + sh_join(cmd))
+        ui.dry_run_cmd(cmd)
         return "dry-run@example.com"
     try:
         r = subprocess.run(cmd, capture_output=True, text=True)
     except FileNotFoundError:
-        fail("gcloud CLI not found. Install: https://cloud.google.com/sdk/docs/install")
+        fail(
+            "gcloud CLI not found",
+            why="Could not execute gcloud.",
+            fix="Install it: https://cloud.google.com/sdk/docs/install"
+        )
     if r.returncode != 0 or not (r.stdout or "").strip():
         fail(
-            "gcloud is not logged in (no active account).\n"
-            "  Run: gcloud auth login\n"
-            "  Then: hth init"
+            "gcloud is not logged in",
+            why="No active account in `gcloud auth list`.",
+            fix="gcloud auth login  # then: hth init"
         )
     return (r.stdout or "").strip().splitlines()[0].strip()
 
@@ -200,7 +240,8 @@ def ensure_local_state():
         if not LOCAL_JOBS_FILE.exists():
             LOCAL_JOBS_FILE.write_text("{}\n", encoding="utf-8")
     except Exception as ex:
-        fail("cannot create %s: %s" % (LOCAL_DIR, ex))
+        fail("cannot create %s" % LOCAL_DIR, why=str(ex),
+             fix="mkdir -p %s  # then retry" % LOCAL_DIR)
 
 
 def load_jobs():
@@ -369,16 +410,29 @@ def cmd_init(args):
     check_gcloud_exists()
     acct = check_gcloud_auth(dry_run=dry_run, project=project)
     if dry_run:
-        print("+ " + sh_join(build_ssh_cmd('echo ready', authorize=True, project=project)))
-        print("+ " + sh_join(build_ssh_cmd("mkdir -p %s && echo ok" % REMOTE_BASE, project=project)))
-        print("dry-run: would ensure %s exists" % LOCAL_JOBS_FILE)
+        ui.dry_run_cmd(build_ssh_cmd('echo ready', authorize=True, project=project))
+        ui.dry_run_cmd(build_ssh_cmd("mkdir -p %s && echo ok" % REMOTE_BASE, project=project))
+        ui.hint("dry-run: would ensure %s exists" % LOCAL_JOBS_FILE)
+        ui.next_step("hth init  # for real")
         return 0
-    ok("gcloud account: %s" % acct)
-    ok("starting Cloud Shell (this can take a minute on first run)...")
-    ssh_run("echo ready", dry_run=False, project=project, authorize=True)
-    ensure_remote_base(dry_run=False, project=project)
-    ensure_local_state()
-    ok("ready: %s exists on Cloud Shell, local state at %s" % (REMOTE_BASE, LOCAL_JOBS_FILE))
+    ui.banner()
+    ui.info("account  %s" % acct)
+    try:
+        with ui.step("Starting Cloud Shell"):
+            ssh_run("echo ready", dry_run=False, project=project, authorize=True)
+        with ui.step("Creating ~/hth/jobs"):
+            ensure_remote_base(dry_run=False, project=project)
+        ensure_local_state()
+    except SystemExit:
+        raise
+    except Exception as ex:
+        if ui.is_debug():
+            traceback.print_exc()
+        fail("init failed", why=str(ex), fix="hth init --dry-run  # inspect commands, then retry")
+    ui.info("")
+    ui.info("ready  %s on Cloud Shell" % REMOTE_BASE)
+    ui.info("local  %s" % LOCAL_JOBS_FILE)
+    ui.next_step('hth run "python3 examples/scrape_example.py"')
     return 0
 
 
@@ -423,13 +477,18 @@ def cmd_run(args):
     # Validate --files / --setup exist locally (unless dry-run with missing? still warn)
     for f in files:
         if not os.path.exists(f):
-            fail("file not found: %s (passed via --files)" % f)
+            fail("file not found: %s" % f,
+                 why="It was passed via --files but does not exist locally.",
+                 fix="ls %s  # check the path, then retry hth run" % f)
     if setup_file and not os.path.exists(setup_file):
-        fail("setup file not found: %s" % setup_file)
+        fail("setup file not found: %s" % setup_file,
+             why="It was passed via --setup but does not exist locally.",
+             fix="ls %s  # check the path, then retry hth run" % setup_file)
 
     job_id = make_job_id()
     if not valid_job_id(job_id):
-        fail("internal: bad job id")
+        fail("internal: bad job id", why="Generated id failed validation. This is a bug.",
+             fix="hth --debug run ...  # re-run with a traceback")
     rdir = remote_job_dir(job_id)
 
     # Decide main command line (runs inside ~/hth/jobs/<id> as cwd)
@@ -442,7 +501,9 @@ def cmd_run(args):
             ("/" in target and " " not in target)
         )
         if looks_like_path:
-            fail("file not found: %s\n  If this was meant as a shell command, quote it. Otherwise check the path." % target)
+            fail("file not found: %s" % target,
+                 why="It looks like a script path but does not exist locally.",
+                 fix='hth run "%s"  # if it was meant as a shell command, quote it' % target)
     main_basename = None
     if is_file:
         main_basename = os.path.basename(target)
@@ -456,7 +517,9 @@ def cmd_run(args):
     else:
         full = " ".join([target] + extra).strip() if target else ""
         if not full:
-            fail("run needs a command or script file. Example: hth run \"python3 job.py\"")
+            fail("run needs a command or script file",
+                 why="No command or file was given.",
+                 fix='hth run "python3 job.py"  # or: hth run ./script.py')
         main_line = full
         display_cmd = full
 
@@ -490,15 +553,19 @@ def cmd_run(args):
     # 1) mkdir remote
     mkdir_cmd = "mkdir -p %s/output && rm -f %s/out.log %s/exit_code && echo ok" % (rdir, rdir, rdir)
     if dry_run:
-        print("+ " + sh_join(build_ssh_cmd(mkdir_cmd, project=project)))
+        ui.dry_run_cmd(build_ssh_cmd(mkdir_cmd, project=project))
     else:
         # auto-heal: ensure base exists (handles VM reset)
         try:
-            ssh_run(mkdir_cmd, dry_run=False, project=project)
+            with ui.step("Creating remote job dir"):
+                ssh_run(mkdir_cmd, dry_run=False, project=project)
         except SystemExit:
             raise
         except Exception as ex:
-            fail("cannot create remote job dir: %s" % ex)
+            if ui.is_debug():
+                traceback.print_exc()
+            fail("cannot create remote job dir", why=str(ex),
+                 fix="hth init  # re-authorize Cloud Shell, then retry")
 
     # 2) scp uploads (batch where possible; dirs need --recurse)
     # Group: single scp call with --recurse if any dir, else without.
@@ -509,23 +576,24 @@ def cmd_run(args):
             src = "localhost:%s" % lp
             dst = "cloudshell:%s/%s" % (rdir, rn)
             # for dirs, scp the dir itself into job dir
-            print("+ " + sh_join(build_scp_cmd([src], dst, recurse=os.path.isdir(lp) if not lp.startswith("<generated") else False, project=project)))
+            ui.dry_run_cmd(build_scp_cmd([src], dst, recurse=os.path.isdir(lp) if not lp.startswith("<generated") else False, project=project))
     else:
-        for (lp, rn) in uploads:
-            if lp == tmp_wrapper:
-                src = "localhost:%s" % lp
-            else:
-                # allow relative paths; gcloud scp accepts local paths
-                src = "localhost:%s" % lp
-            dst = "cloudshell:%s/%s" % (rdir, rn)
-            # If source is a dir, destination should be the job dir (scp -r src jobdir/)
-            # to avoid double-nesting confusion, we scp dir -> jobdir/
-            if os.path.isdir(lp):
-                dst_dir = "cloudshell:%s/" % rdir
-                cmd = build_scp_cmd([src], dst_dir, recurse=True, project=project)
-            else:
-                cmd = build_scp_cmd([src], dst, recurse=False, project=project)
-            run_gcloud(cmd, dry_run=False)
+        with ui.step("Copying %d file(s)" % len(uploads)):
+            for (lp, rn) in uploads:
+                if lp == tmp_wrapper:
+                    src = "localhost:%s" % lp
+                else:
+                    # allow relative paths; gcloud scp accepts local paths
+                    src = "localhost:%s" % lp
+                dst = "cloudshell:%s/%s" % (rdir, rn)
+                # If source is a dir, destination should be the job dir (scp -r src jobdir/)
+                # to avoid double-nesting confusion, we scp dir -> jobdir/
+                if os.path.isdir(lp):
+                    dst_dir = "cloudshell:%s/" % rdir
+                    cmd = build_scp_cmd([src], dst_dir, recurse=True, project=project)
+                else:
+                    cmd = build_scp_cmd([src], dst, recurse=False, project=project)
+                run_gcloud(cmd, dry_run=False)
         # chmod +x run.sh + main script if needed
         ssh_run("chmod +x %s/run.sh && chmod +x %s/%s 2>/dev/null || true; ls -la %s" % (
             rdir, rdir, shlex.quote(main_basename) if main_basename else "run.sh", rdir),
@@ -538,13 +606,15 @@ def cmd_run(args):
         "tmux new-session -d -s {jid} 'bash ~/hth/jobs/{jid}/run.sh >> ~/hth/jobs/{jid}/out.log 2>&1' && echo launched"
     ).format(jid=job_id)
     if dry_run:
-        print("+ " + sh_join(build_ssh_cmd(launch, project=project)))
+        ui.dry_run_cmd(build_ssh_cmd(launch, project=project))
         # cleanup temp? none created in dry-run
-        print("dry-run: would record job %s locally" % job_id)
-        print(job_id)
+        ui.hint("dry-run: would record job %s locally" % job_id)
+        ui.info(job_id)
+        ui.next_step("hth run \"%s\"  # for real (remove --dry-run)" % display_cmd[:60])
         return 0
 
-    ssh_run(launch, dry_run=False, project=project)
+    with ui.step("Launching detached job"):
+        ssh_run(launch, dry_run=False, project=project)
 
     # 4) record locally
     jobs = load_jobs()
@@ -568,16 +638,18 @@ def cmd_run(args):
     if getattr(args, "keepalive", False):
         start_keepalive(job_id, dry_run=False, project=project)
 
-    ok(job_id)
-    eprint("job %s started. Status: hth status %s | Logs: hth logs %s" % (job_id, job_id, job_id))
+    ui.blank()
+    ui.info("job  %s" % ui.accent(job_id))
+    ui.info("cmd  %s" % display_cmd[:100])
+    ui.next_step("hth logs %s -f  # follow output" % job_id)
     return 0
 
 
 def start_keepalive(job_id, dry_run=False, project=None):
     pidfile = LOCAL_DIR / ("keepalive-%s.pid" % job_id)
     if dry_run:
-        print("+ (keepalive) spawn background ssh ping every %ds for job %s" % (KEEPALIVE_INTERVAL_SEC, job_id))
-        print("+ " + sh_join(build_ssh_cmd("echo keepalive", project=project)))
+        ui.hint("keepalive: would spawn background ssh ping every %ds for job %s" % (KEEPALIVE_INTERVAL_SEC, job_id))
+        ui.dry_run_cmd(build_ssh_cmd("echo keepalive", project=project))
         return 0
     ensure_local_state()
     # Spawn detached `hth _keepalive <id>` loop
@@ -597,9 +669,9 @@ def start_keepalive(job_id, dry_run=False, project=None):
             pidfile.write_text(str(p.pid) + "\n", encoding="utf-8")
         except Exception:
             pass
-        eprint("keepalive started (pid %d, every %ds). It stops when you run hth kill/clean." % (p.pid, KEEPALIVE_INTERVAL_SEC))
+        ui.hint("keepalive on (pid %d, every %ds). Stops on hth kill/clean." % (p.pid, KEEPALIVE_INTERVAL_SEC))
     except Exception as ex:
-        warn("cannot start keepalive: %s" % ex)
+        warn(str(ex))
     return 0
 
 
@@ -652,39 +724,42 @@ def cmd_status(args):
     jid = getattr(args, "job_id", None)
 
     if jid and not valid_job_id(jid):
-        fail("bad job id: %s" % jid)
+        fail("bad job id: %s" % jid,
+             why="Job ids look like YYYYMMDD-HHMMSS-xxxxxx (letters, digits, -).",
+             fix="hth status  # list known jobs, then copy an id")
 
     if dry_run:
         if jid:
-            print("+ " + sh_join(build_ssh_cmd("probe job %s" % jid, project=project)))
+            ui.dry_run_cmd(build_ssh_cmd("probe job %s" % jid, project=project))
         else:
-            print("+ " + sh_join(build_ssh_cmd("list ~/hth/jobs/*", project=project)))
-        print("dry-run: would merge remote state with %s" % LOCAL_JOBS_FILE)
+            ui.dry_run_cmd(build_ssh_cmd("list ~/hth/jobs/*", project=project))
+        ui.hint("dry-run: would merge remote state with %s" % LOCAL_JOBS_FILE)
         return 0
 
     if jid:
         info = jobs.get(jid)
         if info is None:
             # Unknown locally - still probe remote (maybe created elsewhere)
-            warn("job %s not in local state %s; probing Cloud Shell anyway" % (jid, LOCAL_JOBS_FILE))
+            warn("job %s not in %s; probing Cloud Shell anyway" % (jid, LOCAL_JOBS_FILE))
             start_iso = None
             cmd_str = "(unknown)"
         else:
             start_iso = info.get("start_time")
             cmd_str = info.get("command", "")
         try:
-            status, rc, _raw = remote_probe_single(jid, dry_run=False, project=project)
+            with ui.step("Checking %s" % jid):
+                status, rc, _raw = remote_probe_single(jid, dry_run=False, project=project)
         except SystemExit:
             raise
         except Exception as ex:
-            fail("status check failed: %s" % ex)
+            if ui.is_debug():
+                traceback.print_exc()
+            fail("status check failed", why=str(ex), fix="hth status %s --dry-run  # inspect probe" % jid)
 
         if status == "missing":
-            eprint(
-                "job %s not found on Cloud Shell.\n"
-                "  It was likely cleaned (hth clean) or the Cloud Shell $HOME was reset.\n"
-                "  Re-created %s automatically; you will need to re-run the job." % (jid, REMOTE_BASE)
-            )
+            ui.error("job %s not found on Cloud Shell" % jid,
+                     why="It was cleaned (hth clean) or the Cloud Shell $HOME was reset.",
+                     fix="hth run ...  # re-run the job")
             try:
                 ensure_remote_base(dry_run=False, project=project)
             except Exception:
@@ -693,18 +768,17 @@ def cmd_status(args):
                 info["last_known_status"] = "missing"
                 jobs[jid] = info
                 save_jobs(jobs)
-            print("id:      %s" % jid)
-            print("status:  missing (lost)")
+            ui.info("id      %s" % ui.accent(jid))
+            ui.info("state   %s" % ui.badge("lost"))
             if start_iso:
-                print("started: %s (%s ago)" % (start_iso, format_elapsed(start_iso)))
+                ui.info("started %s (%s ago)" % (start_iso, format_elapsed(start_iso)))
+            ui.next_step("hth run ...  # re-run the job")
             return 0
 
         if status == "lost":
-            eprint(
-                "job %s was LOST: Cloud Shell VM was reset or slept.\n"
-                "  Its remote dir exists but the tmux session is gone and no exit_code was written.\n"
-                "  %s was ensured to exist; re-run with: hth run ..." % (jid, REMOTE_BASE)
-            )
+            ui.error("job %s was lost" % jid,
+                     why="Cloud Shell VM slept or reset: remote dir exists, tmux gone, no exit_code.",
+                     fix="hth run ...  # re-run the job")
             try:
                 ensure_remote_base(dry_run=False, project=project)
             except Exception:
@@ -718,32 +792,40 @@ def cmd_status(args):
             save_jobs(jobs)
 
         elapsed = format_elapsed(start_iso) if start_iso else "?"
-        print("id:      %s" % jid)
-        print("status:  %s" % status)
-        print("command: %s" % cmd_str)
+        ui.blank()
+        ui.info("id      %s" % ui.accent(jid))
+        ui.info("state   %s" % ui.badge(status))
+        ui.info("cmd     %s" % (cmd_str[:90] if cmd_str else "-"))
         if start_iso:
-            print("started: %s" % start_iso)
-            print("elapsed: %s" % elapsed)
+            ui.info("started %s" % start_iso)
+            ui.info("elapsed %s" % elapsed)
         if rc is not None:
-            print("exit:    %d" % rc)
+            ui.info("exit    %d" % rc)
+        ui.blank()
         if status == "running":
-            print("hint:    hth logs %s -f" % jid)
+            ui.next_step("hth logs %s -f" % jid)
         elif status in ("done", "failed"):
-            print("hint:    hth pull %s" % jid)
+            ui.next_step("hth pull %s" % jid)
+        else:
+            ui.next_step("hth run ...  # re-run the job")
         return 0
     else:
         # list all
         try:
-            remote = remote_list_all(dry_run=False, project=project)
+            with ui.step("Listing jobs"):
+                remote = remote_list_all(dry_run=False, project=project)
         except SystemExit:
             raise
         except Exception as ex:
-            fail("cannot list remote jobs: %s" % ex)
+            if ui.is_debug():
+                traceback.print_exc()
+            fail("cannot list remote jobs", why=str(ex), fix="hth status --dry-run")
 
         # merge: local jobs not on remote -> missing/lost; remote jobs not local -> show anyway
         all_ids = sorted(set(list(jobs.keys())) + list(remote.keys()))
         if not all_ids:
-            ok("no jobs yet. Run one with: hth run \"echo hello\"")
+            ui.info("no jobs yet")
+            ui.next_step('hth run "echo hello"')
             return 0
         # update local statuses
         changed = False
@@ -768,23 +850,31 @@ def cmd_status(args):
             except Exception:
                 pass
 
-        # print table
-        print("%-22s %-10s %-24s %-12s %s" % ("ID", "STATUS", "STARTED", "ELAPSED", "EXIT"))
+        # newest first: local start_time desc, unknown last
+        def _sort_key(k):
+            iso = jobs.get(k, {}).get("start_time", "") if k in jobs else ""
+            return iso or ""
+        all_ids.sort(key=_sort_key, reverse=True)
+
+        rows = []
         for jid2 in all_ids:
             if jid2 in remote:
                 st, rc = remote[jid2]
             else:
                 st = jobs.get(jid2, {}).get("last_known_status", "missing")
                 rc = jobs.get(jid2, {}).get("exit_code")
+            cmd_s = jobs.get(jid2, {}).get("command", "-") or "-"
             start_iso = jobs.get(jid2, {}).get("start_time", "")
-            short_start = start_iso[:19].replace("T", " ") if start_iso else "-"
             elapsed = format_elapsed(start_iso) if start_iso else "-"
-            exit_s = str(rc) if rc is not None else ("-" if st in ("running", "lost", "missing") else "-")
-            print("%-22s %-10s %-24s %-12s %s" % (jid2, st, short_start, elapsed, exit_s))
+            exit_s = str(rc) if rc is not None else "-"
+            rows.append((jid2, cmd_s, ui.badge(st), elapsed, exit_s))
+        ui.blank()
+        ui.table(["id", "command", "state", "elapsed", "exit"], rows)
+        ui.blank()
         lost = [k for k, v in remote.items() if v[0] == "lost"]
         if lost:
-            eprint("\n%d job(s) marked 'lost': Cloud Shell VM slept/reset (tmux gone, no exit_code)." % len(lost))
-            eprint("Re-run them; %s was re-created automatically." % REMOTE_BASE)
+            ui.warn("%d job(s) lost: Cloud Shell slept/reset (tmux gone, no exit_code)." % len(lost))
+        ui.next_step("hth status <id>  # details, or hth logs <id> -f")
         return 0
 
 
@@ -794,21 +884,24 @@ def cmd_logs(args):
     check_gcloud_exists()
     jid = args.job_id
     if not valid_job_id(jid):
-        fail("bad job id: %s" % jid)
+        fail("bad job id: %s" % jid,
+             why="Job ids look like YYYYMMDD-HHMMSS-xxxxxx (letters, digits, -).",
+             fix="hth status  # list known jobs, then copy an id")
     follow = bool(getattr(args, "follow", False))
     lines = int(getattr(args, "lines", 100) or 100)
     rdir = remote_job_dir(jid)
 
     if dry_run:
-        print("+ " + sh_join(build_ssh_cmd("tail -n %d %s/out.log" % (lines, rdir), project=project)))
+        ui.dry_run_cmd(build_ssh_cmd("tail -n %d %s/out.log" % (lines, rdir), project=project))
         if follow:
-            print("+ (follow) would poll every 2s via ssh")
+            ui.hint("follow: would poll every 2s via ssh")
+        ui.next_step("hth logs %s  # for real (remove --dry-run)" % jid)
         return 0
 
     if not follow:
         r = ssh_run("tail -n %d %s/out.log 2>/dev/null || echo '[hth] no logs yet (job may still be starting)'" % (lines, rdir),
                     dry_run=False, project=project)
-        sys.stdout.write(r.stdout or "")
+        ui.print_logs(r.stdout or "")
         return 0
 
     # follow: poll new bytes via `tail -c +N`
@@ -816,8 +909,7 @@ def cmd_logs(args):
     # First, get current size so we only follow new? No - show last `lines` first.
     r0 = ssh_run("tail -n %d %s/out.log 2>/dev/null || echo '[hth] waiting for logs...'" % (lines, rdir),
                  dry_run=False, project=project)
-    sys.stdout.write(r0.stdout or "")
-    sys.stdout.flush()
+    ui.print_logs(r0.stdout or "")
     try:
         # estimate offset as byte length of full file
         rsize = ssh_run("wc -c < %s/out.log 2>/dev/null || echo 0" % rdir, dry_run=False, project=project)
@@ -827,7 +919,7 @@ def cmd_logs(args):
             offset = 0
     except Exception:
         offset = 0
-    eprint("[hth] following %s/out.log (Ctrl-C to stop)..." % rdir)
+    ui.err(ui.dim("following %s/out.log (Ctrl-C to stop)..." % rdir))
     try:
         while True:
             time.sleep(2)
@@ -835,8 +927,7 @@ def cmd_logs(args):
             r = ssh_run("tail -c +%d %s/out.log 2>/dev/null" % (nxt, rdir), dry_run=False, project=project)
             chunk = r.stdout or ""
             if chunk:
-                sys.stdout.write(chunk)
-                sys.stdout.flush()
+                ui.print_logs(chunk)
                 try:
                     offset += len(chunk.encode("utf-8"))
                 except Exception:
@@ -849,14 +940,16 @@ def cmd_logs(args):
                     r2 = ssh_run("tail -c +%d %s/out.log 2>/dev/null" % (offset + 1, rdir),
                                  dry_run=False, project=project)
                     if r2.stdout:
-                        sys.stdout.write(r2.stdout)
-                        sys.stdout.flush()
-                    eprint("\n[hth] job %s: %s" % (jid, st))
+                        ui.print_logs(r2.stdout)
+                    ui.err("")
+                    ui.err("job %s: %s" % (jid, ui.badge(st)))
                     break
             except Exception:
                 pass
     except KeyboardInterrupt:
-        eprint("\n[hth] stopped following")
+        ui.err("")
+        ui.err(ui.dim("stopped following"))
+    ui.next_step("hth pull %s  # when output/ is ready" % jid)
     return 0
 
 
@@ -866,17 +959,20 @@ def cmd_pull(args):
     check_gcloud_exists()
     jid = args.job_id
     if not valid_job_id(jid):
-        fail("bad job id: %s" % jid)
+        fail("bad job id: %s" % jid,
+             why="Job ids look like YYYYMMDD-HHMMSS-xxxxxx.",
+             fix="hth status  # list known jobs, then copy an id")
     dest = getattr(args, "dest", None) or os.path.join("results", jid)
     rdir = remote_job_dir(jid)
 
     if dry_run:
-        print("+ mkdir -p %s" % shlex.quote(dest))
-        print("+ " + sh_join(build_scp_cmd(
+        ui.hint("mkdir -p %s" % shlex.quote(dest))
+        ui.dry_run_cmd(build_scp_cmd(
             ["cloudshell:%s/output" % rdir],
             "localhost:%s" % dest,
-            recurse=True, project=project)))
-        print("dry-run: remote %s/output -> local %s/ (contents)" % (rdir, dest))
+            recurse=True, project=project))
+        ui.hint("dry-run: remote %s/output -> local %s/ (contents)" % (rdir, dest))
+        ui.next_step("hth pull %s  # for real (remove --dry-run)" % jid)
         return 0
 
     # Ensure parent exists but NOT dest itself, so `scp -r remote/output dest`
@@ -886,14 +982,18 @@ def cmd_pull(args):
     dest_exists_before = os.path.exists(dest)
 
     # Quick check that remote output exists
-    r = ssh_run("if [ -d %s/output ]; then ls -la %s/output; else echo HTH_NO_OUTPUT; fi" % (rdir, rdir),
-                dry_run=False, project=project)
+    with ui.step("Checking remote output"):
+        r = ssh_run("if [ -d %s/output ]; then ls -la %s/output; else echo HTH_NO_OUTPUT; fi" % (rdir, rdir),
+                    dry_run=False, project=project)
     if "HTH_NO_OUTPUT" in (r.stdout or ""):
-        fail("no output/ dir for job %s yet (did the job create ./output/?)" % jid)
+        fail("no output/ dir for job %s yet" % jid,
+             why="The job has not created ./output/ on Cloud Shell (or it already failed).",
+             fix="hth logs %s  # check what happened" % jid)
 
-    cmd = build_scp_cmd(["cloudshell:%s/output" % rdir], "localhost:%s" % dest,
-                        recurse=True, project=project)
-    run_gcloud(cmd, dry_run=False)
+    with ui.step("Pulling output"):
+        cmd = build_scp_cmd(["cloudshell:%s/output" % rdir], "localhost:%s" % dest,
+                            recurse=True, project=project)
+        run_gcloud(cmd, dry_run=False)
 
     # Normalize: if dest existed before, scp likely created dest/output/*. Move up.
     nested = os.path.join(dest, "output")
@@ -915,7 +1015,9 @@ def cmd_pull(args):
                 os.rmdir(nested)
         except Exception:
             pass
-    ok("pulled %s/output -> %s/" % (rdir, dest))
+    ui.blank()
+    ui.info("pulled  %s/output -> %s/" % (rdir, dest))
+    ui.next_step("ls %s" % dest)
     return 0
 
 
@@ -925,21 +1027,25 @@ def cmd_kill(args):
     check_gcloud_exists()
     jid = args.job_id
     if not valid_job_id(jid):
-        fail("bad job id: %s" % jid)
+        fail("bad job id: %s" % jid,
+             why="Job ids look like YYYYMMDD-HHMMSS-xxxxxx.",
+             fix="hth status  # list known jobs, then copy an id")
     rdir = remote_job_dir(jid)
     remote_cmd = 'tmux kill-session -t %s 2>/dev/null && echo "killed %s" || echo "no tmux session %s (already done/lost)"' % (
         shlex.quote(jid), jid, jid)
     if dry_run:
-        print("+ " + sh_join(build_ssh_cmd(remote_cmd, project=project)))
-        print("dry-run: would mark %s as killed locally" % jid)
+        ui.dry_run_cmd(build_ssh_cmd(remote_cmd, project=project))
+        ui.hint("dry-run: would mark %s as killed locally" % jid)
         return 0
-    r = ssh_run(remote_cmd, dry_run=False, project=project)
-    sys.stdout.write(r.stdout or "")
+    with ui.step("Killing %s" % jid):
+        r = ssh_run(remote_cmd, dry_run=False, project=project)
+    ui.print_logs(r.stdout or "")
     stop_keepalive(jid)
     jobs = load_jobs()
     if jid in jobs:
         jobs[jid]["last_known_status"] = "killed"
         save_jobs(jobs)
+    ui.next_step("hth status %s  # confirm, or hth clean %s" % (jid, jid))
     return 0
 
 
@@ -950,38 +1056,43 @@ def cmd_clean(args):
     jid = getattr(args, "job_id", None)
     yes = bool(getattr(args, "yes", False))
     if jid and not valid_job_id(jid):
-        fail("bad job id: %s" % jid)
+        fail("bad job id: %s" % jid,
+             why="Job ids look like YYYYMMDD-HHMMSS-xxxxxx.",
+             fix="hth status  # list known jobs, then copy an id")
 
     if jid:
         remote_cmd = "rm -rf ~/hth/jobs/%s && echo cleaned %s" % (shlex.quote(jid), jid)
         if dry_run:
-            print("+ " + sh_join(build_ssh_cmd(remote_cmd, project=project)))
-            print("dry-run: would remove %s from %s" % (jid, LOCAL_JOBS_FILE))
+            ui.dry_run_cmd(build_ssh_cmd(remote_cmd, project=project))
+            ui.hint("dry-run: would remove %s from %s" % (jid, LOCAL_JOBS_FILE))
             return 0
-        ssh_run(remote_cmd, dry_run=False, project=project)
+        with ui.step("Cleaning %s" % jid):
+            ssh_run(remote_cmd, dry_run=False, project=project)
         stop_keepalive(jid)
         jobs = load_jobs()
         jobs.pop(jid, None)
         save_jobs(jobs)
-        ok("cleaned %s" % jid)
+        ui.info("cleaned %s" % jid)
+        ui.next_step("hth status  # remaining jobs")
         return 0
 
     # clean all
     if not yes and not dry_run:
-        eprint("Remove ALL remote jobs in ~/hth/jobs and clear local state? [y/N] ", end="")
+        ui.err("Remove ALL remote jobs in ~/hth/jobs and clear local state? [y/N] ")
         try:
             ans = input().strip().lower()
         except EOFError:
             ans = ""
         if ans not in ("y", "yes"):
-            ok("aborted")
+            ui.info("aborted")
             return 0
     remote_cmd = "rm -rf ~/hth/jobs && mkdir -p ~/hth/jobs && echo cleaned-all"
     if dry_run:
-        print("+ " + sh_join(build_ssh_cmd(remote_cmd, project=project)))
-        print("dry-run: would clear %s" % LOCAL_JOBS_FILE)
+        ui.dry_run_cmd(build_ssh_cmd(remote_cmd, project=project))
+        ui.hint("dry-run: would clear %s" % LOCAL_JOBS_FILE)
         return 0
-    ssh_run(remote_cmd, dry_run=False, project=project)
+    with ui.step("Cleaning all jobs"):
+        ssh_run(remote_cmd, dry_run=False, project=project)
     # stop all keepalives
     try:
         for p in LOCAL_DIR.glob("keepalive-*.pid"):
@@ -1000,26 +1111,64 @@ def cmd_clean(args):
     except Exception:
         pass
     save_jobs({})
-    ok("cleaned all jobs")
+    ui.info("cleaned all jobs")
+    ui.next_step('hth run "echo hello"  # start fresh')
     return 0
 
 
 # ---------- argparse ----------
 
+def _add_common_flags(parser):
+    parser.add_argument("--dry-run", dest="dry_run", action="store_true",
+                        help="print gcloud commands instead of running them")
+    parser.add_argument("--project", dest="project", default=None, metavar="P",
+                        help="GCP project override (or HTH_PROJECT)")
+    parser.add_argument("--no-color", dest="no_color", action="store_true",
+                        help="plain output, no ANSI colors or spinners")
+    parser.add_argument("--debug", dest="debug", action="store_true",
+                        help="show raw tracebacks on failure")
+
+
 def build_parser():
-    p = argparse.ArgumentParser(prog="hth", description="Hand long-running tasks off to Google Cloud Shell.")
+    p = argparse.ArgumentParser(
+        prog="hth",
+        description="Hand long-running tasks off to Google Cloud Shell.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Setup:\n"
+               "  hth init                                   # first-time auth + ~/hth/jobs\n"
+               "Run:\n"
+               "  hth run \"python3 job.py\"                   # detached in tmux\n"
+               "  hth run ./scrape.py --files data/          # with uploads\n"
+               "Inspect:\n"
+               "  hth status                                 # all jobs, newest first\n"
+               "  hth logs <id> -f                           # follow output\n"
+               "  hth pull <id>                              # fetch ./output/\n"
+               "Cleanup:\n"
+               "  hth kill <id>                              # stop tmux session\n"
+               "  hth clean <id>                             # remove one job\n",
+    )
     p.add_argument("--dry-run", dest="global_dry_run", action="store_true",
                    help="print gcloud commands instead of running them")
     p.add_argument("--project", dest="global_project", default=None,
                    help="GCP project (or set HTH_PROJECT). Passed as --project to gcloud.")
+    p.add_argument("--no-color", dest="global_no_color", action="store_true",
+                   help="plain output, no ANSI colors or spinners")
+    p.add_argument("--debug", dest="global_debug", action="store_true",
+                   help="show raw tracebacks on failure")
     p.add_argument("--version", action="version", version="hth " + VERSION)
     sub = p.add_subparsers(dest="cmd", required=True, metavar="<command>")
 
-    q = sub.add_parser("init", help="check gcloud, start Cloud Shell, create ~/hth/jobs")
-    q.add_argument("--dry-run", dest="dry_run", action="store_true", help="print gcloud commands")
-    q.add_argument("--project", dest="project", default=None, help="GCP project override")
+    _fmt = argparse.RawDescriptionHelpFormatter
+    q = sub.add_parser("init", help="check gcloud, start Cloud Shell, create ~/hth/jobs",
+                       description="Authorize Cloud Shell and create ~/hth/jobs.",
+                       epilog="Example:\n  hth init",
+                       formatter_class=_fmt)
+    _add_common_flags(q)
 
-    r = sub.add_parser("run", help="run a command or script file detached on Cloud Shell")
+    r = sub.add_parser("run", help="run a command or script file detached on Cloud Shell",
+                       description="Copy a script + files to ~/hth/jobs/<id>/ and launch it detached in tmux.",
+                       epilog="Example:\n  hth run \"python3 -u job.py --out ./output\"\n  hth run ./scrape.py --files data/ --keepalive",
+                       formatter_class=_fmt)
     r.add_argument("target", help="shell command string OR path to .py/.sh file")
     r.add_argument("extra", nargs="*", help="extra args (appended to command, or passed to script)")
     r.add_argument("--files", nargs="*", default=[], metavar="F",
@@ -1028,77 +1177,112 @@ def build_parser():
                    help="local setup script uploaded as setup.sh (runs first)")
     r.add_argument("--keepalive", action="store_true",
                    help="spawn background ssh ping to keep Cloud Shell awake")
-    r.add_argument("--dry-run", dest="dry_run", action="store_true", help="print gcloud commands")
-    r.add_argument("--project", dest="project", default=None, help="GCP project override")
+    _add_common_flags(r)
 
-    s = sub.add_parser("status", help="list jobs or show one job")
+    s = sub.add_parser("status", help="list jobs or show one job",
+                       description="List jobs (newest first) or show one job with state and elapsed time.",
+                       epilog="Example:\n  hth status\n  hth status 20261116-120000-ab12cd",
+                       formatter_class=_fmt)
     s.add_argument("job_id", nargs="?", default=None, help="job id (omit to list all)")
-    s.add_argument("--dry-run", dest="dry_run", action="store_true", help="print gcloud commands")
-    s.add_argument("--project", dest="project", default=None, help="GCP project override")
+    _add_common_flags(s)
 
-    lg = sub.add_parser("logs", help="show job logs")
+    lg = sub.add_parser("logs", help="show job logs",
+                        description="Tail ~/hth/jobs/<id>/out.log over ssh. -f polls for new bytes.",
+                        epilog="Example:\n  hth logs 20261116-120000-ab12cd -f",
+                        formatter_class=_fmt)
     lg.add_argument("job_id", help="job id")
     lg.add_argument("-f", "--follow", action="store_true", help="follow (polls over ssh)")
     lg.add_argument("-n", "--lines", type=int, default=100, help="lines to show (default 100)")
-    lg.add_argument("--dry-run", dest="dry_run", action="store_true", help="print gcloud commands")
-    lg.add_argument("--project", dest="project", default=None, help="GCP project override")
+    _add_common_flags(lg)
 
-    pl = sub.add_parser("pull", help="copy remote output/ back to ./results/<id>/")
+    pl = sub.add_parser("pull", help="copy remote output/ back to ./results/<id>/",
+                        description="Copy ~/hth/jobs/<id>/output/ to ./results/<id>/ via scp.",
+                        epilog="Example:\n  hth pull 20261116-120000-ab12cd",
+                        formatter_class=_fmt)
     pl.add_argument("job_id", help="job id")
     pl.add_argument("--dest", dest="dest", default=None, help="local dir (default results/<id>)")
-    pl.add_argument("--dry-run", dest="dry_run", action="store_true", help="print gcloud commands")
-    pl.add_argument("--project", dest="project", default=None, help="GCP project override")
+    _add_common_flags(pl)
 
-    k = sub.add_parser("kill", help="kill a running job (tmux session)")
+    k = sub.add_parser("kill", help="kill a running job (tmux session)",
+                       description="Kill the tmux session for a job. Logs and output stay on Cloud Shell.",
+                       epilog="Example:\n  hth kill 20261116-120000-ab12cd",
+                       formatter_class=_fmt)
     k.add_argument("job_id", help="job id")
-    k.add_argument("--dry-run", dest="dry_run", action="store_true", help="print gcloud commands")
-    k.add_argument("--project", dest="project", default=None, help="GCP project override")
+    _add_common_flags(k)
 
-    c = sub.add_parser("clean", help="remove remote job dirs")
+    c = sub.add_parser("clean", help="remove remote job dirs",
+                       description="Remove one remote job dir, or all jobs with confirmation.",
+                       epilog="Example:\n  hth clean 20261116-120000-ab12cd\n  hth clean -y",
+                       formatter_class=_fmt)
     c.add_argument("job_id", nargs="?", default=None, help="job id (omit for all)")
     c.add_argument("-y", "--yes", action="store_true", help="skip confirmation for clean-all")
-    c.add_argument("--dry-run", dest="dry_run", action="store_true", help="print gcloud commands")
-    c.add_argument("--project", dest="project", default=None, help="GCP project override")
+    _add_common_flags(c)
 
     hk = sub.add_parser("_keepalive", help=argparse.SUPPRESS)
     hk.add_argument("job_id", nargs="?", default=None)
     hk.add_argument("--project", dest="project", default=None)
+    hk.add_argument("--no-color", dest="no_color", action="store_true", help=argparse.SUPPRESS)
+    hk.add_argument("--debug", dest="debug", action="store_true", help=argparse.SUPPRESS)
+    hk.add_argument("--dry-run", dest="dry_run", action="store_true", help=argparse.SUPPRESS)
     return p
 
 
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
-    # defaults for dry_run when subparser didn't define it
-    if not hasattr(args, "dry_run"):
-        args.dry_run = False
+    # defaults for flags when subparser didn't define them
+    for _name, _default in (("dry_run", False), ("no_color", False), ("debug", False),
+                            ("project", None), ("global_no_color", False),
+                            ("global_debug", False), ("global_dry_run", False),
+                            ("global_project", None)):
+        if not hasattr(args, _name):
+            setattr(args, _name, _default)
+    try:
+        ui.configure(no_color=effective_no_color(args), debug=effective_debug(args))
+    except Exception:
+        pass
     cmd = args.cmd
-    if cmd == "init":
-        return cmd_init(args)
-    if cmd == "run":
-        return cmd_run(args)
-    if cmd == "status":
-        return cmd_status(args)
-    if cmd == "logs":
-        return cmd_logs(args)
-    if cmd == "pull":
-        return cmd_pull(args)
-    if cmd == "kill":
-        return cmd_kill(args)
-    if cmd == "clean":
-        return cmd_clean(args)
-    if cmd == "_keepalive":
-        # normalize: _keepalive takes job_id positionally as `job_id`
-        class A:
-            pass
-        a = A()
-        a.job_id = getattr(args, "job_id", None)
-        a.target = a.job_id
-        a.project = getattr(args, "project", None)
-        a.global_project = getattr(args, "global_project", None)
-        return cmd_keepalive_loop(a)
-    parser.print_help()
-    return 2
+    try:
+        if cmd == "init":
+            return cmd_init(args)
+        if cmd == "run":
+            return cmd_run(args)
+        if cmd == "status":
+            return cmd_status(args)
+        if cmd == "logs":
+            return cmd_logs(args)
+        if cmd == "pull":
+            return cmd_pull(args)
+        if cmd == "kill":
+            return cmd_kill(args)
+        if cmd == "clean":
+            return cmd_clean(args)
+        if cmd == "_keepalive":
+            # normalize: _keepalive takes job_id positionally as `job_id`
+            class A:
+                pass
+            a = A()
+            a.job_id = getattr(args, "job_id", None)
+            a.target = a.job_id
+            a.project = getattr(args, "project", None)
+            a.global_project = getattr(args, "global_project", None)
+            return cmd_keepalive_loop(a)
+        parser.print_help()
+        return 2
+    except KeyboardInterrupt:
+        ui.err("")
+        ui.err(ui.dim("cancelled"))
+        return 130
+    except SystemExit:
+        raise
+    except Exception as ex:
+        if ui.is_debug():
+            traceback.print_exc()
+            return 1
+        ui.error("unexpected failure: %s" % ex,
+                 why="This is a bug, not your command. Nothing was sent twice.",
+                 fix="hth --debug %s  # re-run with a traceback" % " ".join(sys.argv[1:3]))
+        return 1
 
 
 if __name__ == "__main__":
