@@ -1,2 +1,9 @@
 .opencode/
 .DS_Store
+__pycache__/
+*.pyc
+*.pyo
+results/
+output/
+*.log
+.hth/
